@@ -1,0 +1,746 @@
+'use strict';
+const express = require('express');
+const session = require('express-session');
+const rateLimit = require('express-rate-limit');
+const multer = require('multer');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const mammoth = require('mammoth');
+const XLSX = require('xlsx');
+const { PDFParse } = require('pdf-parse');
+
+const app = express();
+const PORT = 3000;
+const DATA = path.resolve(process.env.DATA_DIR || '/data');
+const USER = process.env.APP_USER;
+const PASSWORD = process.env.APP_PASSWORD;
+const SECRET = process.env.SESSION_SECRET;
+const MAX_MB = Math.max(1, Number(process.env.MAX_UPLOAD_MB || 100));
+// Secciones de la biblioteca de música. Cada una es una carpeta dentro del volumen de datos.
+const CATEGORIES = ['Xino', 'Niros'];
+// Solo documentos con información (texto, Word, PDF y planillas).
+const ALLOWED = new Set(['txt','md','csv','tsv','log','doc','docx','xls','xlsx','xlsm','pdf']);
+
+if (!USER || !PASSWORD || PASSWORD.length < 14 || !SECRET || SECRET.length < 32) {
+  console.error('Configurá APP_USER, APP_PASSWORD (mínimo 14 caracteres) y SESSION_SECRET (mínimo 32 caracteres).');
+  process.exit(1);
+}
+fs.mkdirSync(DATA, { recursive: true });
+for (const category of CATEGORIES) fs.mkdirSync(path.join(DATA, category), { recursive: true });
+const SESSION_DIR = path.join(DATA, 'sessions');
+fs.mkdirSync(SESSION_DIR, { recursive: true, mode: 0o700 });
+
+class JsonSessionStore extends session.Store {
+  constructor() {
+    super();
+    this.reaper = setInterval(() => this.removeExpired(), 30 * 60 * 1000);
+    this.reaper.unref();
+  }
+  filename(sid) { return path.join(SESSION_DIR, crypto.createHash('sha256').update(sid).digest('hex') + '.json'); }
+  get(sid, cb) {
+    fs.promises.readFile(this.filename(sid), 'utf8').then(raw => {
+      const sess = JSON.parse(raw); const expiry = sess.cookie && sess.cookie.expires ? new Date(sess.cookie.expires).getTime() : 0;
+      if (expiry && expiry <= Date.now()) return this.destroy(sid, () => cb(null, null));
+      cb(null, sess);
+    }).catch(err => cb(err.code === 'ENOENT' ? null : err, null));
+  }
+  set(sid, sess, cb = () => {}) {
+    const file = this.filename(sid); const temp = file + '.' + crypto.randomBytes(5).toString('hex') + '.tmp';
+    fs.promises.writeFile(temp, JSON.stringify(sess), { encoding: 'utf8', mode: 0o600 })
+      .then(() => fs.promises.rename(temp, file)).then(() => cb(null)).catch(err => { fs.promises.rm(temp, { force: true }).catch(() => {}); cb(err); });
+  }
+  touch(sid, sess, cb) { this.set(sid, sess, cb); }
+  destroy(sid, cb = () => {}) { fs.promises.rm(this.filename(sid), { force: true }).then(() => cb(null)).catch(cb); }
+  async removeExpired() {
+    try {
+      for (const name of await fs.promises.readdir(SESSION_DIR)) {
+        if (!name.endsWith('.json')) continue;
+        const file = path.join(SESSION_DIR, name);
+        try { const sess = JSON.parse(await fs.promises.readFile(file, 'utf8')); if (sess.cookie?.expires && new Date(sess.cookie.expires).getTime() <= Date.now()) await fs.promises.rm(file, { force: true }); }
+        catch { await fs.promises.rm(file, { force: true }); }
+      }
+    } catch (e) { console.error('No se pudieron limpiar sesiones expiradas:', e.message); }
+  }
+}
+
+app.disable('x-powered-by');
+if (process.env.TRUST_PROXY === '1') app.set('trust proxy', 1);
+app.use(express.urlencoded({ extended: false, limit: '20kb' }));
+app.use(express.json({ limit: '2mb' }));
+app.use(session({
+  name: 'archivoit.sid', secret: SECRET, resave: false, saveUninitialized: false,
+  store: new JsonSessionStore(),
+  cookie: { httpOnly: true, sameSite: 'strict', secure: process.env.COOKIE_SECURE === '1', maxAge: 8 * 60 * 60 * 1000 }
+}));
+const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 8, standardHeaders: true, legacyHeaders: false });
+const loggedIn = (req, res, next) => req.session.authenticated ? next() : res.status(401).json({ error: 'Iniciá sesión para continuar.' });
+const safeEqual = (a, b) => {
+  const aa = Buffer.from(String(a)); const bb = Buffer.from(String(b));
+  return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
+};
+app.post('/api/login', authLimiter, (req, res) => {
+  if (safeEqual(req.body.username || '', USER) && safeEqual(req.body.password || '', PASSWORD)) {
+    req.session.regenerate(err => { if (err) return res.status(500).json({ error: 'No se pudo iniciar sesión.' }); req.session.authenticated = true; res.json({ ok: true }); });
+  } else res.status(401).json({ error: 'Usuario o contraseña incorrectos.' });
+});
+app.post('/api/logout', loggedIn, (req, res) => req.session.destroy(() => res.json({ ok: true })));
+app.get('/api/me', (req, res) => res.json({ authenticated: Boolean(req.session.authenticated) }));
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    // La sección es obligatoria: Xino o Niros.
+    if (!CATEGORIES.includes(req.body.category)) return cb(new Error(`Elegí una sección: ${CATEGORIES.join(' o ')}.`));
+    cb(null, path.join(DATA, req.body.category));
+  },
+  filename: (req, file, cb) => {
+    req.uploadIndex = (req.uploadIndex || 0) + 1;
+    const original = path.basename(file.originalname).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').trim().slice(0, 160) || 'archivo';
+    const ext = path.extname(original); const stem = path.basename(original, ext);
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    cb(null, `${stem}__${stamp}_${crypto.randomBytes(3).toString('hex')}${ext}`);
+  }
+});
+const upload = multer({ storage, limits: { fileSize: MAX_MB * 1024 * 1024, files: 100 }, fileFilter: (req, file, cb) => {
+  const ext = path.extname(file.originalname).slice(1).toLowerCase();
+  const accepted = !ext || ALLOWED.has(ext);
+  cb(accepted ? null : new Error('Formato no admitido: ' + ext), accepted);
+} });
+app.post('/api/upload', loggedIn, (req, res) => upload.array('files', 100)(req, res, err => {
+  if (err) return res.status(400).json({ error: err.code === 'LIMIT_FILE_SIZE' ? `Cada archivo puede pesar hasta ${MAX_MB} MB.` : err.message });
+  cacheAt = 0;
+  res.json({ ok: true, count: (req.files || []).length });
+}));
+
+function categoryFor(rel) { return CATEGORIES.find(c => rel.split(path.sep)[0] === c) || CATEGORIES[0]; }
+function fileType(ext) {
+  if (['xls','xlsx','xlsm','csv','tsv'].includes(ext)) return 'Excel';
+  if (!ext) return 'Texto';
+  if (['doc','docx'].includes(ext)) return 'Word';
+  if (ext === 'pdf') return 'PDF';
+  if (['txt','md','log','ps1','bat','sh','yml','yaml','conf','ini','json','xml','sql','py','crt','pem'].includes(ext)) return 'Texto';
+  return 'Texto';
+}
+async function extract(file, ext) {
+  try {
+    if (!ext || ['txt','md','csv','tsv','log','ps1','bat','sh','yml','yaml','conf','ini','json','xml','sql','py','crt','pem'].includes(ext)) return fs.readFileSync(file, 'utf8');
+    if (ext === 'docx') return (await mammoth.extractRawText({ path: file })).value;
+    if (['xls','xlsx','xlsm'].includes(ext)) {
+      const wb = XLSX.readFile(file, { cellText: true, cellDates: true });
+      return wb.SheetNames.map(name => `Hoja: ${name}\n${XLSX.utils.sheet_to_csv(wb.Sheets[name])}`).join('\n');
+    }
+    if (ext === 'pdf') {
+      const parser = new PDFParse({ data: fs.readFileSync(file) });
+      try { return (await parser.getText()).text; } finally { await parser.destroy(); }
+    }
+  } catch (e) { return ''; }
+  return '';
+}
+async function walk(dir, output = []) {
+  for (const ent of await fs.promises.readdir(dir, { withFileTypes: true })) {
+    if (ent.name.startsWith('.') || ent.name === 'sessions') continue;
+    const abs = path.join(dir, ent.name);
+    if (ent.isDirectory()) await walk(abs, output); else if (ent.isFile()) output.push(abs);
+  }
+  return output;
+}
+const cache = new Map();
+// Texto ya extraído por archivo (ruta + fecha + tamaño). Evita releer todo cada 5 minutos.
+const contentStore = new Map();
+let cacheAt = 0, indexing = false, refreshPromise = null;
+// Normaliza sin acentos ni mayúsculas conservando la longitud, para ubicar fragmentos en el texto original.
+function foldKeep(value) {
+  return String(value || '').replace(/[^\x00-\x7f]/g, ch => {
+    const f = ch.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+    if (f.length === 1) return f;
+    const l = ch.toLowerCase();
+    return l.length === 1 ? l : ch;
+  }).replace(/[A-Z]/g, c => c.toLowerCase());
+}
+function setItemContent(item, content) {
+  item.content = content || '';
+  item.contentN = foldKeep(item.content);
+  item.words = null;
+  contentStore.set(item.abs, { mtime:item.mtime, size:item.size, content:item.content, contentN:item.contentN });
+}
+async function ensureCache() {
+  if (refreshPromise) { await refreshPromise; return; }
+  if (indexing && cacheAt) return;
+  if (cacheAt && Date.now() - cacheAt <= 300000) return;
+  refreshPromise = (async () => {
+    // Solo se muestran los archivos de las secciones (Xino y Niros); el resto del volumen queda intacto pero oculto.
+    const paths = [];
+    for (const category of CATEGORIES) await walk(path.join(DATA, category), paths);
+    const entries = [];
+    for (const abs of paths) {
+      let stat; try { stat = await fs.promises.stat(abs); } catch { continue; }
+      const rel = path.relative(DATA, abs);
+      const ext = path.extname(abs).slice(1).toLowerCase();
+      const originalName = path.basename(abs).replace(/__[0-9TZ-]+_[a-f0-9]{6}(?=\.|$)/, '');
+      const cat = categoryFor(rel);
+      const item = { id:crypto.createHash('sha256').update(abs).digest('hex'), abs, rel, name:originalName, ext, type:fileType(ext), category:cat, size:stat.size, mtime:stat.mtimeMs, content:'', contentN:'', nameN:foldKeep(originalName), relN:foldKeep(rel), catN:foldKeep(cat), words:null, indexed:false };
+      const known = contentStore.get(abs);
+      if (known && known.mtime === item.mtime && known.size === item.size) { item.content = known.content; item.contentN = known.contentN; item.indexed = true; }
+      entries.push(item);
+    }
+    const alive = new Set(paths);
+    for (const abs of contentStore.keys()) if (!alive.has(abs)) contentStore.delete(abs);
+    cache.clear();
+    for (const item of entries) cache.set(item.abs, item);
+    cacheAt = Date.now();
+    const toIndex = entries.filter(x => !x.indexed && ALLOWED.has(x.ext) && x.ext !== 'doc');
+    if (!toIndex.length) return;
+    indexing = true;
+    (async () => {
+      try {
+        for (let i = 0; i < toIndex.length; i += 2) {
+          await Promise.all(toIndex.slice(i, i + 2).map(async item => { setItemContent(item, await extract(item.abs, item.ext)); item.indexed = true; }));
+        }
+      } catch (e) { console.error('Error al indexar archivos:', e.message); }
+      finally { indexing = false; cacheAt = Date.now(); }
+    })();
+  })().finally(() => { refreshPromise = null; });
+  await refreshPromise;
+}
+// ---- Motor de búsqueda compartido por la web y los bots ----
+// Admite: varias palabras (todas deben aparecer), "frase exacta", -excluir, tipo:pdf / ext:xlsx, cat:xino / cat:niros.
+const TYPE_ALIASES = { pdf:'PDF', word:'Word', docx:'Word', excel:'Excel', planilla:'Excel', xlsx:'Excel', csv:'Excel', texto:'Texto', txt:'Texto' };
+function parseQuery(raw) {
+  const q = { terms:[], phrases:[], exclude:[], exts:[], types:[], cats:[] };
+  const re = /(-?)"([^"]*)"?|(\S+)/g; let m;
+  const text = String(raw || '').slice(0, 300);
+  while ((m = re.exec(text))) {
+    if (m[2] !== undefined) {
+      const v = foldKeep(m[2]).trim().replace(/\s+/g, ' ');
+      if (!v) continue;
+      if (m[1]) q.exclude.push(v); else if (v.includes(' ')) q.phrases.push(v); else q.terms.push(v);
+      continue;
+    }
+    let token = foldKeep(m[3]);
+    const f = token.match(/^(tipo|type|ext|cat|categoria):(.+)$/);
+    if (f) {
+      const val = f[2];
+      if (f[1] === 'ext') q.exts.push(val.replace(/^\./, ''));
+      else if (f[1] === 'cat' || f[1] === 'categoria') q.cats.push(val);
+      else if (TYPE_ALIASES[val]) q.types.push(TYPE_ALIASES[val]); else q.exts.push(val);
+      continue;
+    }
+    token = token.replace(/^[.,;:!?¿¡()\[\]{}'«»]+|[.,;:!?¿¡()\[\]{}'«»]+$/g, '');
+    if (!token) continue;
+    if (token.startsWith('-') && token.length > 1) q.exclude.push(token.slice(1)); else if (token !== '-') q.terms.push(token);
+  }
+  q.terms = [...new Set(q.terms)];
+  return q;
+}
+function countOccurrences(hay, needle, max = 25) {
+  if (!needle) return 0; let n = 0, i = hay.indexOf(needle);
+  while (i !== -1 && n < max) { n++; i = hay.indexOf(needle, i + needle.length); }
+  return n;
+}
+function wordStart(hay, needle) {
+  let i = hay.indexOf(needle);
+  while (i !== -1) { if (i === 0 || !/[a-z0-9ñ]/.test(hay[i - 1])) return true; i = hay.indexOf(needle, i + 1); }
+  return false;
+}
+function editDistance(a, b, max) {
+  if (Math.abs(a.length - b.length) > max) return max + 1;
+  let prev = Array.from({ length:b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i]; let best = i;
+    for (let j = 1; j <= b.length; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+      if (cur[j] < best) best = cur[j];
+    }
+    if (best > max) return max + 1;
+    prev = cur;
+  }
+  return prev[b.length];
+}
+function itemWords(item) {
+  if (!item.words) {
+    const set = new Set();
+    for (const src of [item.nameN, item.relN, item.contentN]) for (const w of src.split(/[^a-z0-9ñ_]+/)) { if (w.length >= 3 && w.length <= 40) set.add(w); if (set.size >= 30000) break; }
+    item.words = set;
+  }
+  return item.words;
+}
+// Para tolerar errores de tipeo: devuelve la palabra real más parecida del archivo.
+function fuzzyWord(item, term) {
+  if (term.length < 4) return null;
+  const max = term.length >= 8 ? 2 : 1;
+  let best = null, bestD = max + 1;
+  for (const w of itemWords(item)) {
+    if (Math.abs(w.length - term.length) > max) continue;
+    const d = editDistance(term, w, max);
+    if (d < bestD) { best = w; bestD = d; if (d === 1 && max === 1) break; }
+  }
+  return best;
+}
+function scoreItem(item, q, fuzzy) {
+  const hay = `${item.nameN} ${item.relN} ${item.catN} ${item.contentN}`;
+  for (const ex of q.exclude) if (hay.includes(ex)) return null;
+  let score = 0; const matched = [];
+  for (const ph of q.phrases) {
+    if (!hay.includes(ph)) return null;
+    matched.push(ph);
+    score += item.nameN.includes(ph) ? 60 : 0;
+    score += 12 + Math.min(countOccurrences(item.contentN, ph), 10) * 3;
+  }
+  let allInName = q.terms.length > 0;
+  for (const original of q.terms) {
+    let term = original;
+    if (!hay.includes(term)) {
+      if (!fuzzy) return null;
+      term = fuzzyWord(item, original);
+      if (!term) return null;
+      score -= 8;
+    }
+    matched.push(term);
+    if (item.nameN.includes(term)) { score += 30; if (wordStart(item.nameN, term)) score += 15; if (item.nameN.replace(/\.[^.]+$/, '') === term) score += 40; }
+    else allInName = false;
+    if (item.relN.includes(term)) score += 6;
+    if (item.catN.includes(term)) score += 4;
+    const c = countOccurrences(item.contentN, term);
+    if (c) score += 8 + Math.min(c, 15) * 2 + (wordStart(item.contentN, term) ? 4 : 0);
+  }
+  if (allInName) score += 25;
+  if (q.terms.length > 1) {
+    const joined = q.terms.join(' ');
+    if (item.nameN.includes(joined)) score += 35;
+    if (item.contentN.includes(joined)) score += 15;
+  }
+  // Leve preferencia por lo modificado recientemente (máx. 5 puntos en los últimos 30 días).
+  score += Math.max(0, 5 - (Date.now() - item.mtime) / (6 * 86400000));
+  return { score, matched:[...new Set(matched)] };
+}
+function buildSnippet(item, matched) {
+  if (!matched.length || !item.contentN) return '';
+  let bestPos = -1, bestHits = -1;
+  const firsts = matched.map(t => item.contentN.indexOf(t)).filter(i => i >= 0).sort((a,b) => a - b);
+  for (const pos of firsts.slice(0, 6)) {
+    const win = item.contentN.slice(Math.max(0, pos - 80), pos + 160);
+    const hits = matched.filter(t => win.includes(t)).length;
+    if (hits > bestHits) { bestHits = hits; bestPos = pos; }
+  }
+  if (bestPos < 0) return '';
+  const from = Math.max(0, bestPos - 70), to = Math.min(item.content.length, bestPos + 190);
+  return (from > 0 ? '… ' : '') + item.content.slice(from, to).replace(/\s+/g, ' ').trim() + (to < item.content.length ? ' …' : '');
+}
+function searchLibrary(raw, { category = 'all', type = 'all', sort = 'relevance' } = {}) {
+  const q = parseQuery(raw);
+  const hasQuery = q.terms.length || q.phrases.length || q.exclude.length;
+  const base = [...cache.values()].filter(x =>
+    (category === 'all' || x.category === category) && (type === 'all' || x.type === type) &&
+    (!q.exts.length || q.exts.includes(x.ext)) && (!q.types.length || q.types.includes(x.type)) &&
+    (!q.cats.length || q.cats.some(c => x.catN.startsWith(c))));
+  const run = fuzzy => {
+    const out = [];
+    for (const item of base) {
+      if (!hasQuery) { out.push({ item, score:0, matched:[] }); continue; }
+      const r = scoreItem(item, q, fuzzy);
+      if (r) out.push({ item, ...r });
+    }
+    return out;
+  };
+  let results = run(false), fuzzy = false;
+  if (!results.length && q.terms.length) { results = run(true); fuzzy = results.length > 0; }
+  const byName = (a, b) => a.item.name.localeCompare(b.item.name, 'es');
+  if (sort === 'name' || (sort === 'relevance' && !hasQuery)) results.sort(byName);
+  else if (sort === 'recent') results.sort((a, b) => b.item.mtime - a.item.mtime || byName(a, b));
+  else if (sort === 'size') results.sort((a, b) => b.item.size - a.item.size || byName(a, b));
+  else results.sort((a, b) => b.score - a.score || byName(a, b));
+  return { results, fuzzy, query:q };
+}
+app.get('/api/files', loggedIn, async (req, res) => {
+  try {
+    await ensureCache();
+    const cat = String(req.query.category || 'all'); const type = String(req.query.type || 'all');
+    const sort = ['relevance','name','recent','size'].includes(req.query.sort) ? req.query.sort : 'relevance';
+    const everything = [...cache.values()];
+    const counts = Object.fromEntries(CATEGORIES.map(c => [c, everything.filter(x => x.category === c).length]));
+    const typeCounts = {}; for (const x of everything) typeCounts[x.type] = (typeCounts[x.type] || 0) + 1;
+    const { results, fuzzy } = searchLibrary(req.query.q, { category:cat, type, sort });
+    const highlight = [...new Set(results.slice(0, 200).flatMap(r => r.matched))].slice(0, 20);
+    res.json({ files: results.map(({ item:x, matched, score }) => ({
+      id:x.id, name:x.name, rel:x.rel, ext:x.ext, type:x.type, category:x.category, size:x.size, mtime:x.mtime,
+      snippet: buildSnippet(x, matched), score:Math.round(score), open:`/api/file/${x.id}`
+    })), fuzzy, highlight, indexing, categories:CATEGORIES, counts, typeCounts, stats:{ total:everything.length, topics:Object.values(counts).filter(Boolean).length, sheets:everything.filter(x => x.type === 'Excel').length, indexed:everything.filter(x => x.content).length } });
+  } catch (e) { console.error('Error de búsqueda:', e.message); res.status(500).json({ error: 'No se pudo leer la biblioteca.' }); }
+});
+const EDITABLE_TEXT = new Set(['txt','md','csv','tsv','log','ps1','bat','sh','yml','yaml','conf','ini','json','xml','sql','py','crt','pem']);
+const TELEGRAM_APPENDABLE_TEXT = new Set(['txt','md','csv','tsv','log']);
+function getCachedItem(id) { return [...cache.values()].find(x => x.id === id); }
+app.get('/api/edit/:id', loggedIn, async (req,res) => {
+  const item = getCachedItem(req.params.id);
+  if (!item || !item.abs.startsWith(DATA + path.sep)) return res.sendStatus(404);
+  if (EDITABLE_TEXT.has(item.ext)) {
+    const text = await fs.promises.readFile(item.abs, 'utf8');
+    if (text.length > 500000) return res.status(413).json({ error: 'El archivo supera el límite de edición de 500 KB.' });
+    return res.json({ kind: 'text', name: item.name, text });
+  }
+  if (item.ext === 'xlsx') {
+    const wb = XLSX.readFile(item.abs, { cellDates: true });
+    const sheets = wb.SheetNames.map(name => {
+      const ws = wb.Sheets[name];
+      const range = ws['!ref'] ? XLSX.utils.decode_range(ws['!ref']) : { s:{r:0,c:0}, e:{r:0,c:0} };
+      const rows = [];
+      for (let r = range.s.r; r <= Math.min(range.e.r, range.s.r + 99); r++) {
+        const row = [];
+        for (let c = range.s.c; c <= Math.min(range.e.c, range.s.c + 19); c++) {
+          const cell = ws[XLSX.utils.encode_cell({r,c})];
+          row.push(cell ? String(cell.w ?? cell.v ?? '') : '');
+        }
+        rows.push(row);
+      }
+      return { name, startRow:range.s.r, startCol:range.s.c, rows, truncated:range.e.r-range.s.r>=100 || range.e.c-range.s.c>=20 };
+    });
+    return res.json({ kind: 'workbook', name:item.name, sheets });
+  }
+  return res.status(415).json({ error: 'Este formato no se puede editar desde la app. Descargalo, modificalo y volvé a subirlo.' });
+});
+app.post('/api/edit/:id', loggedIn, async (req,res) => {
+  const item = getCachedItem(req.params.id);
+  if (!item || !item.abs.startsWith(DATA + path.sep)) return res.sendStatus(404);
+  try {
+    if (EDITABLE_TEXT.has(item.ext)) {
+      if (typeof req.body.text !== 'string' || req.body.text.length > 500000) return res.status(400).json({ error: 'El texto es inválido o supera 500 KB.' });
+      const temp = item.abs + '.' + crypto.randomBytes(5).toString('hex') + '.tmp';
+      await fs.promises.writeFile(temp, req.body.text, { encoding:'utf8', mode:0o600 });
+      await fs.promises.rename(temp, item.abs);
+    } else if (item.ext === 'xlsx') {
+      const updates = req.body.updates;
+      if (!Array.isArray(updates) || updates.length > 500) return res.status(400).json({ error: 'La edición de planilla es inválida.' });
+      const wb = XLSX.readFile(item.abs, { cellDates:true });
+      for (const change of updates) {
+        if (!change || !wb.SheetNames.includes(change.sheet) || !Number.isInteger(change.r) || !Number.isInteger(change.c) || change.r < 0 || change.r >= 10000 || change.c < 0 || change.c >= 1000 || typeof change.value !== 'string' || change.value.length > 10000) return res.status(400).json({ error: 'Hay una celda inválida.' });
+        const ws = wb.Sheets[change.sheet];
+        const address = XLSX.utils.encode_cell({ r:change.r, c:change.c });
+        const cell = ws[address] || {};
+        cell.t = 's'; cell.v = change.value; delete cell.f; ws[address] = cell;
+        const range = ws['!ref'] ? XLSX.utils.decode_range(ws['!ref']) : { s:{r:change.r,c:change.c}, e:{r:change.r,c:change.c} };
+        range.s.r = Math.min(range.s.r, change.r); range.s.c = Math.min(range.s.c, change.c); range.e.r = Math.max(range.e.r, change.r); range.e.c = Math.max(range.e.c, change.c);
+        ws['!ref'] = XLSX.utils.encode_range(range);
+      }
+      const buffer = XLSX.write(wb, { type:'buffer', bookType:'xlsx', cellStyles:true });
+      const temp = item.abs + '.' + crypto.randomBytes(5).toString('hex') + '.tmp';
+      await fs.promises.writeFile(temp, buffer, { mode:0o600 });
+      await fs.promises.rename(temp, item.abs);
+    } else return res.status(415).json({ error: 'Este formato no se puede editar desde la app.' });
+    cache.clear(); cacheAt = 0;
+    return res.json({ ok:true });
+  } catch (e) { console.error('No se pudo guardar el archivo:', e.message); return res.status(500).json({ error:'No se pudieron guardar los cambios.' }); }
+});app.get('/api/preview/:id', loggedIn, async (req,res) => {
+  const item = [...cache.values()].find(x => x.id === req.params.id);
+  if (!item || !item.abs.startsWith(DATA + path.sep)) return res.sendStatus(404);
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  if (item.ext === 'pdf') {
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(item.name)}`);
+    return res.sendFile(item.abs);
+  }
+  if (item.ext === 'doc') return res.status(415).json({ error: 'La vista previa no está disponible para este formato. Podés descargarlo.' });
+  const text = item.content || await extract(item.abs, item.ext);
+  const limit = 150000;
+  res.json({ name: item.name, text: text.slice(0, limit), truncated: text.length > limit });
+});app.delete('/api/file/:id', loggedIn, async (req,res) => {
+  const item = [...cache.values()].find(x => x.id === req.params.id);
+  if (!item || !item.abs.startsWith(DATA + path.sep)) return res.sendStatus(404);
+  try {
+    await fs.promises.unlink(item.abs);
+    cache.delete(item.abs); cacheAt = 0;
+    return res.json({ ok:true });
+  } catch (e) {
+    if (e.code === 'ENOENT') return res.sendStatus(404);
+    console.error('No se pudo eliminar el archivo:', e.message);
+    return res.status(500).json({ error:'No se pudo eliminar el archivo.' });
+  }
+});app.get('/api/file/:id', loggedIn, (req,res) => {
+  const item = [...cache.values()].find(x => x.id === req.params.id);
+  if (!item || !item.abs.startsWith(DATA + path.sep)) return res.sendStatus(404);
+  res.download(item.abs, item.name);
+});
+app.use('/api', (req,res) => res.status(404).json({ error:'Ruta inexistente.' }));
+app.use(express.static(path.join(__dirname, 'public'), { index: false, etag: true, maxAge: '1h' }));
+app.get('/{*splat}', (req,res) => req.session.authenticated ? res.sendFile(path.join(__dirname,'public','index.html')) : res.sendFile(path.join(__dirname,'public','login.html')));
+// Bot de Telegram opcional. El token y la lista permitida se configuran en Portainer.
+const telegramToken = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
+const telegramAllowedUsers = new Set(String(process.env.TELEGRAM_ALLOWED_USERS || '').split(/[\s,;]+/).filter(x => /^\d+$/.test(x)));
+const telegramChoices = new Map();
+const telegramPending = new Map();
+const telegramApi = telegramToken ? `https://api.telegram.org/bot${telegramToken}` : '';
+function normalizeSearch(value) {
+  return String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLocaleLowerCase();
+}
+async function telegramCall(method, body = {}) {
+  const response = await fetch(`${telegramApi}/${method}`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body), signal: AbortSignal.timeout(method === 'getUpdates' ? 35000 : 15000)
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || !result.ok) {
+    const error = new Error(String(result.description || `HTTP ${response.status}`).slice(0, 240));
+    error.telegramCode = result.error_code || response.status;
+    throw error;
+  }
+  return result.result;
+}
+function splitText(text, max, minCut) {
+  const chunks = [];
+  let rest = String(text || '');
+  while (rest.length > max) {
+    let cut = rest.lastIndexOf('\n', max);
+    if (cut < minCut) cut = max;
+    chunks.push(rest.slice(0, cut)); rest = rest.slice(cut).trimStart();
+  }
+  if (rest) chunks.push(rest);
+  return chunks;
+}
+async function telegramSend(chatId, text) {
+  // Telegram admite hasta 4096 caracteres; se mantiene margen para evitar rechazos.
+  for (const chunk of splitText(text, 3500, 1000)) await telegramCall('sendMessage', { chat_id: chatId, text: chunk, disable_web_page_preview: true });
+}
+const wrapSend = (ctx) => (t) => ctx.send(String(t).replace(/§(buscar|agregar|confirmar|cancelar)/g, (ctx.platform === 'discord' ? '!' : '/') + '$1'));
+// ---- Voz: el audio se transcribe con un servicio Whisper aparte (WHISPER_URL) ----
+const whisperUrl = String(process.env.WHISPER_URL || '').trim().replace(/\/+$/, '');
+const whisperToken = String(process.env.WHISPER_TOKEN || '').trim();
+const VOICE_MAX_SECONDS = Math.max(5, Number(process.env.VOICE_MAX_SECONDS || 60));
+const VOICE_MAX_BYTES = 10 * 1024 * 1024;
+class VoiceError extends Error {}
+async function transcribeAudio(buffer) {
+  let response;
+  try {
+    response = await fetch(`${whisperUrl}/transcribe`, {
+      method: 'POST', body: buffer, signal: AbortSignal.timeout(180000),
+      headers: { 'content-type': 'application/octet-stream', ...(whisperToken ? { authorization: `Bearer ${whisperToken}` } : {}) }
+    });
+  } catch { throw new VoiceError('No pude conectar con el servicio de voz (Whisper). Probá de nuevo en un rato.'); }
+  const data = await response.json().catch(() => ({}));
+  if (response.status === 401) throw new VoiceError('El servicio de voz rechazó la clave (revisá WHISPER_TOKEN).');
+  if (!response.ok) throw new VoiceError(String(data.error || `El servicio de voz respondió con error ${response.status}.`).slice(0, 200));
+  return String(data.text || '').trim();
+}
+// "Buscá a backup." -> "backup" (saca el verbo inicial y la puntuación de los bordes)
+function cleanVoiceQuery(text) {
+  const filler = /^\s*(?:(?:por\s+favor|hola|che)[\s,]+)*(?:busc[aá](?:r|me|lo)?|dame|dec[ií]me|tra[eé](?:me|r)?|mostr[aá](?:me|r)?|consult[aá](?:r|me)?|quiero\s+ver|necesito)(?:\s+(?:a|al|el|la|los|las|de|del|info|informaci[oó]n\s+de(?:l)?))*\s+/i;
+  return String(text || '').replace(filler, '').replace(/^[\s.,;:!?¿¡"'«»]+|[\s.,;:!?¿¡"'«»]+$/g, '');
+}
+async function handleVoiceMessage(ctx, getAudio, { duration = 0, size = 0 } = {}) {
+  if (!ctx.allowed.has(ctx.userId)) return; // sin respuesta a usuarios no autorizados
+  const send = wrapSend(ctx);
+  if (!whisperUrl) return send('La búsqueda por voz no está configurada. Escribime la consulta.');
+  if (duration > VOICE_MAX_SECONDS) return send(`El audio es muy largo (máximo ${VOICE_MAX_SECONDS} segundos).`);
+  if (size > VOICE_MAX_BYTES) return send('El audio es demasiado pesado.');
+  const key = `${ctx.platform}:${ctx.chatId}:${ctx.userId}`;
+  const pending = telegramPending.get(key);
+  const active = pending && pending.expires > Date.now() ? pending : null;
+  // Cambios en archivos: la confirmación siempre se escribe, nunca se acepta por voz.
+  if (active && active.state === 'confirm') return send('Por seguridad, confirmá escribiendo §confirmar (o §cancelar). No acepto confirmaciones por voz.');
+  let transcript;
+  try { transcript = await transcribeAudio(await getAudio()); }
+  catch (error) {
+    if (error instanceof VoiceError) return send(error.message);
+    console.error(`No pude procesar un audio (${ctx.platform}).`);
+    return send('No pude procesar ese audio. Probá de nuevo o escribime la consulta.');
+  }
+  // Si estaba dictando texto para agregar, se usa tal cual; si no, se lo trata como una búsqueda.
+  const text = active && active.state === 'await_text' ? transcript : cleanVoiceQuery(transcript);
+  if (!text) return send('No pude entender el audio. Probá de nuevo, hablando cerca y más despacio.');
+  await send(`🎙 Entendí: «${transcript}»`);
+  return handleBotMessage({ ...ctx, text });
+}
+// Handler compartido por Telegram y Discord. ctx = { platform, userId, chatId, text, send, allowed, allowEnv }
+// En los textos fijos, §comando se muestra como /comando (Telegram) o !comando (Discord).
+async function handleBotMessage(ctx) {
+  const { platform, userId, chatId, text, allowed, allowEnv } = ctx;
+  const send = wrapSend(ctx);
+  if (/^\/id(?:@\w+)?(?:\s|$)/i.test(text)) {
+    return send(`Tu ID de ${platform === 'discord' ? 'Discord' : 'Telegram'} es: ${userId}\nAgregalo en Portainer como ${allowEnv} y redeplegá el Stack.`);
+  }
+  if (!allowed.has(userId)) return; // No revelar si el bot contiene datos.
+  const key = `${platform}:${chatId}:${userId}`;
+  if (/^\/(start|help)(?:@\w+)?(?:\s|$)/i.test(text)) {
+    return send('Archivo IT está listo. Escribí una palabra o usá §buscar backup para consultar archivos. Para agregar texto, usá §agregar backup (o “agregame info backup”), elegí un número, escribí el texto y confirmalo. §cancelar descarta la operación.');
+  }
+  if (/^\/cancelar(?:@\w+)?(?:\s|$)/i.test(text)) {
+    telegramChoices.delete(key); telegramPending.delete(key);
+    return send('Listo, cancelé la operación y descarté el texto pendiente.');
+  }
+  const pending = telegramPending.get(key);
+  if (pending && pending.expires > Date.now() && pending.state === 'await_text') {
+    if (!text) return send('Mandame el texto que querés agregar o escribí §cancelar.');
+    if (text.length > 20000) return send('El texto supera el máximo de 20.000 caracteres. Mandá una versión más corta o escribí §cancelar.');
+    const item = getCachedItem(pending.id);
+    if (!item || !TELEGRAM_APPENDABLE_TEXT.has(item.ext)) { telegramPending.delete(key); return send('Ese archivo ya no está disponible para agregar texto.'); }
+    pending.state = 'confirm'; pending.text = text; pending.expires = Date.now() + 10 * 60 * 1000;
+    const preview = text.length > 900 ? `${text.slice(0, 900)}\n[… vista previa recortada …]` : text;
+    return send(`Voy a agregar esto al final de “${item.name}”:\n\n${preview}\n\n¿Está todo bien? Respondé §confirmar para guardar o §cancelar para descartar.`);
+  }
+  if (pending && pending.expires > Date.now() && pending.state === 'confirm') {
+    if (/^\/confirmar(?:@\w+)?$|^si,? agregar!?$/i.test(text)) {
+      const item = getCachedItem(pending.id);
+      if (!item || !TELEGRAM_APPENDABLE_TEXT.has(item.ext) || !item.abs.startsWith(DATA + path.sep)) { telegramPending.delete(key); return send('No pude validar el archivo. No se hicieron cambios.'); }
+      try {
+        const current = await fs.promises.readFile(item.abs, 'utf8');
+        const addition = pending.text;
+        if (Buffer.byteLength(current, 'utf8') + Buffer.byteLength(addition, 'utf8') + 2 > 500000) return send('El archivo superaría el límite de 500 KB para edición desde la aplicación. No se hicieron cambios.');
+        const updated = `${current}${current && !current.endsWith('\n') ? '\n' : ''}${addition}${addition.endsWith('\n') ? '' : '\n'}`;
+        const temp = item.abs + '.' + crypto.randomBytes(5).toString('hex') + '.tmp';
+        await fs.promises.writeFile(temp, updated, { encoding:'utf8', mode:0o600 });
+        await fs.promises.rename(temp, item.abs);
+        telegramPending.delete(key); cacheAt = 0;
+        return send(`Listo. Agregué la información al final de “${item.name}”.`);
+      } catch (error) {
+        console.error('Telegram no pudo guardar un cambio en un archivo.');
+        return send('No pude guardar el cambio. El archivo no se modificó; probá desde la web o revisá permisos del volumen.');
+      }
+    }
+    return send('Todavía no guardé nada. Respondé §confirmar para agregarlo o §cancelar para descartarlo.');
+  }
+  if (pending) telegramPending.delete(key);
+  const addRequest = text.match(/^(?:\/agregar(?:@\w+)?|agregame\s+(?:info|informaci[oó]n))(?:\s+(.+))?$/i);
+  if (addRequest) {
+    const query = (addRequest[1] || '').trim().replace(/^(?:al?\s+archivo\s+|al?\s+|a\s+)/i, '');
+    await ensureCache();
+    const terms = normalizeSearch(query).split(/\s+/).filter(Boolean);
+    const matches = [...cache.values()].filter(item => !terms.length || terms.every(term => normalizeSearch(`${item.name} ${item.rel}`).includes(term))).sort((a,b) => a.name.localeCompare(b.name, 'es')).slice(0,10);
+    if (!matches.length) return send(indexing ? 'Todavía estoy leyendo la biblioteca. Esperá unos segundos y repetí §agregar.' : 'No encontré archivos con ese nombre. Probá con una parte distinta del título.');
+    telegramChoices.set(key, { action:'append', items:matches.map(({id}) => ({id})), expires:Date.now() + 10 * 60 * 1000 });
+    return send(`¿A cuál archivo querés agregar información?${query ? ` (búsqueda: “${query}”)` : ''}\n\n${matches.map((item,index) => `${index+1}. ${item.name}${TELEGRAM_APPENDABLE_TEXT.has(item.ext) ? '' : ' (no admite agregar texto desde el bot)'}`).join('\n')}${cache.size > matches.length && !query ? '\n\nMostrando los primeros 10 archivos.' : ''}\n\nRespondé con el número.`);
+  }
+  const choice = telegramChoices.get(key);
+  if (/^\d+$/.test(text) && choice && choice.expires > Date.now()) {
+    const selected = choice.items[Number(text) - 1];
+    if (!selected) return send(`Elegí un número del 1 al ${choice.items.length}.`);
+    telegramChoices.delete(key);
+    await ensureCache();
+    const item = getCachedItem(selected.id);
+    if (!item) return send('Ese archivo ya no está disponible. Hacé la búsqueda de nuevo.');
+    if (choice.action === 'append') {
+      if (!TELEGRAM_APPENDABLE_TEXT.has(item.ext)) return send(`“${item.name}” no admite agregar texto desde el bot. Para proteger el formato, no hice cambios. Usá un archivo TXT, MD, CSV, TSV o LOG.`);
+      telegramPending.set(key, { state:'await_text', id:item.id, expires:Date.now() + 10 * 60 * 1000 });
+      return send(`Elegiste “${item.name}”. Ahora escribí la información que querés agregar. Todavía no se guardará: primero te mostraré una vista previa para que la confirmes.`);
+    }
+    if (!item.content && item.ext === 'doc') return send(`${item.name}\nEste formato no se puede leer desde el bot. Abrilo o descargalo desde la web de Archivo IT.`);
+    const content = item.content || await extract(item.abs, item.ext);
+    if (!content.trim()) return send(`${item.name}\nNo pude extraer texto de este archivo. Podés abrirlo o descargarlo desde la web.`);
+    const limit = 12000;
+    const excerpt = content.length > limit ? `${content.slice(0, limit)}\n\n[Contenido recortado. Consultá el archivo completo en la web.]` : content;
+    return send(`${item.name}\n\n${excerpt}`);
+  }
+  const query = text.replace(/^\/buscar(?:@\w+)?\s*/i, '').trim();
+  if (!query || query.startsWith('/')) return send('Escribí una búsqueda, por ejemplo: backup o §buscar backup.');
+  await ensureCache();
+  const { results: found, fuzzy } = searchLibrary(query);
+  const matches = found.slice(0, 10).map(r => r.item);
+  if (!matches.length) {
+    return send(indexing ? 'Todavía estoy leyendo los documentos. Esperá unos segundos y repetí la búsqueda.' : 'No encontré archivos que coincidan con esa búsqueda.');
+  }
+  telegramChoices.set(key, { items: matches.map(({id}) => ({id})), expires: Date.now() + 10 * 60 * 1000 });
+  const list = matches.map((item, index) => `${index + 1}. ${item.name}`).join('\n');
+  const header = fuzzy ? `No encontré “${query}” exacto; estos son los resultados más parecidos` : `Encontré ${found.length} coincidencia${found.length === 1 ? '' : 's'} para “${query}”${found.length > 10 ? ' (muestro las 10 más relevantes)' : ''}`;
+  return send(`${header}:\n\n${list}\n\nRespondé con el número para ver su contenido.`);
+}
+async function telegramDownload(fileId) {
+  const file = await telegramCall('getFile', { file_id: fileId });
+  const response = await fetch(`https://api.telegram.org/file/bot${telegramToken}/${file.file_path}`, { signal: AbortSignal.timeout(30000) });
+  if (!response.ok) throw new Error('descarga fallida');
+  return Buffer.from(await response.arrayBuffer());
+}
+function handleTelegramMessage(message) {
+  if (!message || !message.from || !message.chat || message.chat.type !== 'private') return;
+  const ctx = {
+    platform: 'telegram', userId: String(message.from.id), chatId: message.chat.id,
+    send: (t) => telegramSend(message.chat.id, t),
+    deleteInput: () => telegramCall('deleteMessage', { chat_id:message.chat.id, message_id:message.message_id }),
+    allowed: telegramAllowedUsers, allowEnv: 'TELEGRAM_ALLOWED_USERS'
+  };
+  if (typeof message.text === 'string') return handleBotMessage({ ...ctx, text: message.text.trim() });
+  const audio = message.voice || message.audio;
+  if (audio) return handleVoiceMessage(ctx, () => telegramDownload(audio.file_id), { duration: audio.duration, size: audio.file_size });
+}
+// Bot de Discord opcional (solo mensajes directos). Token y lista permitida se configuran en Portainer.
+const discordToken = String(process.env.DISCORD_BOT_TOKEN || '').trim();
+const discordAllowedUsers = new Set(String(process.env.DISCORD_ALLOWED_USERS || '').split(/[\s,;]+/).filter(x => /^\d+$/.test(x)));
+async function discordSend(message, text) {
+  // Límite de Discord: 2000 caracteres. Se envía en bloque de código para conservar tal cual claves y símbolos (y poder copiarlos).
+  for (const chunk of splitText(text, 1850, 500)) {
+    if (!chunk.trim()) continue;
+    await message.channel.send({ content: '```\n' + chunk.replace(/```/g, '``​`') + '\n```', allowedMentions: { parse: [] } });
+  }
+}
+function handleDiscordMessage(message) {
+  if (!message || !message.author || message.author.bot || message.guild) return; // solo DM
+  const ctx = {
+    platform: 'discord', userId: String(message.author.id), chatId: message.channelId || message.author.id,
+    send: (t) => discordSend(message, t), allowed: discordAllowedUsers, allowEnv: 'DISCORD_ALLOWED_USERS'
+  };
+  const content = typeof message.content === 'string' ? message.content.trim() : '';
+  if (content) return handleBotMessage({ ...ctx, text: content.replace(/^!/, '/') }); // los comandos usan ! en Discord
+  const audio = message.attachments && [...message.attachments.values()].find(a => String(a.contentType || '').startsWith('audio/'));
+  if (audio) return handleVoiceMessage(ctx, async () => {
+    const response = await fetch(audio.url, { signal: AbortSignal.timeout(30000) });
+    if (!response.ok) throw new Error('descarga fallida');
+    return Buffer.from(await response.arrayBuffer());
+  }, { duration: audio.duration || 0, size: audio.size || 0 });
+}
+async function startDiscordBot() {
+  if (!discordToken) { console.log('Bot de Discord desactivado (DISCORD_BOT_TOKEN vacío).'); return; }
+  if (!discordAllowedUsers.size) console.warn('Discord está configurado, pero falta DISCORD_ALLOWED_USERS; las consultas quedan bloqueadas.');
+  let Discord;
+  try { Discord = require('discord.js'); }
+  catch { console.error('Discord: falta la dependencia discord.js (reconstruí la imagen del Stack).'); return; }
+  const client = new Discord.Client({
+    intents: [Discord.GatewayIntentBits.DirectMessages],
+    partials: [Discord.Partials.Channel, Discord.Partials.Message]
+  });
+  client.once(Discord.Events.ClientReady, (c) => console.log('Bot de Discord conectado con consultas privadas y acceso restringido.'));
+  client.on(Discord.Events.MessageCreate, async (message) => {
+    try { await handleDiscordMessage(message); }
+    catch (error) { console.error(`Discord no pudo procesar un mensaje (${error.code || 'error'}).`); }
+  });
+  client.on(Discord.Events.Error, (error) => console.error(`Discord: error de conexión (${error.code || 'red'}).`));
+  try { await client.login(discordToken); }
+  catch (error) { console.error(`Discord no pudo iniciar (verificá el token y la salida a Internet; ${error.code || 'error'}).`); }
+}
+async function startTelegramBot() {
+  if (!telegramToken) { console.log('Bot de Telegram desactivado (TELEGRAM_BOT_TOKEN vacío).'); return; }
+  if (!telegramAllowedUsers.size) console.warn('Telegram está configurado, pero falta TELEGRAM_ALLOWED_USERS; las consultas quedan bloqueadas.');
+  let offset = 0;
+  try {
+    const webhook = await telegramCall('getWebhookInfo');
+    if (webhook.url) { console.error('Telegram: hay un webhook configurado. Se conserva; quitá el webhook o usá un bot dedicado para activar polling.'); return; }
+  } catch (error) {
+    console.error(`Telegram no pudo iniciar (verificá el token y la salida a Internet; código ${error.telegramCode || 'red'}).`);
+    return;
+  }
+  console.log('Bot de Telegram iniciado con consultas privadas y acceso restringido.');
+  while (true) {
+    try {
+      const updates = await telegramCall('getUpdates', { offset, timeout: 25, allowed_updates: ['message'] });
+      for (const update of updates) {
+        offset = Math.max(offset, update.update_id + 1);
+        try { await handleTelegramMessage(update.message); }
+        catch (error) { console.error(`Telegram no pudo procesar un mensaje (código ${error.telegramCode || 'red'}).`); }
+      }
+      for (const [key, value] of telegramChoices) if (value.expires <= Date.now()) telegramChoices.delete(key);
+      for (const [key, value] of telegramPending) if (value.expires <= Date.now()) telegramPending.delete(key);
+    } catch (error) {
+      if (error.telegramCode === 409) console.error('Telegram: otro proceso está consultando este bot; revisá que no exista otro poller activo.');
+      else console.error(`Telegram perdió conexión temporalmente (código ${error.telegramCode || 'red'}); reintentará.`);
+      await new Promise(resolve => setTimeout(resolve, 5000));
+    }
+  }
+}
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Archivo IT escuchando en ${PORT}`);
+  void startTelegramBot();
+  void startDiscordBot();
+});
+
+
+
+
+
+
+
+

@@ -1,0 +1,34 @@
+services:
+  archivo-it:
+    build: .
+    container_name: archivo-it
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-9090}:3000"
+    environment:
+      APP_USER: "${APP_USER:-}"
+      APP_PASSWORD: "${APP_PASSWORD:-}"
+      SESSION_SECRET: "${SESSION_SECRET:-}"
+      DATA_DIR: /data
+      TRUST_PROXY: "1"
+      COOKIE_SECURE: "${COOKIE_SECURE:-0}"
+      MAX_UPLOAD_MB: "100"
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"
+      TELEGRAM_ALLOWED_USERS: "${TELEGRAM_ALLOWED_USERS:-}"
+      DISCORD_BOT_TOKEN: "${DISCORD_BOT_TOKEN:-}"
+      DISCORD_ALLOWED_USERS: "${DISCORD_ALLOWED_USERS:-}"
+      WHISPER_URL: "${WHISPER_URL:-}"
+      WHISPER_TOKEN: "${WHISPER_TOKEN:-}"
+    volumes:
+      - archivo_it_data:/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+
+volumes:
+  archivo_it_data:
+    name: archivo_it_data
