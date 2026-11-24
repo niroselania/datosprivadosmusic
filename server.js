@@ -520,6 +520,10 @@ app.get('/{*splat}', (req,res) => { noStore(res); res.sendFile(path.join(__dirna
 // Bot de Telegram opcional. El token y la lista permitida se configuran en Portainer.
 const telegramToken = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const telegramAllowedUsers = new Set(String(process.env.TELEGRAM_ALLOWED_USERS || '').split(/[\s,;]+/).filter(x => /^\d+$/.test(x)));
+// Grupos donde el bot puede responder: TELEGRAM_ALLOWED_GROUPS o IDs negativos puestos en TELEGRAM_ALLOWED_USERS.
+// Dentro del grupo solo atiende a los usuarios de TELEGRAM_ALLOWED_USERS.
+const telegramAllowedGroups = new Set(`${process.env.TELEGRAM_ALLOWED_GROUPS || ''},${process.env.TELEGRAM_ALLOWED_USERS || ''}`.split(/[\s,;]+/).filter(x => /^-\d+$/.test(x)));
+let telegramBotUser = '';
 const telegramChoices = new Map();
 const telegramPending = new Map();
 const telegramApi = telegramToken ? `https://api.telegram.org/bot${telegramToken}` : '';
@@ -709,7 +713,35 @@ async function telegramDownload(fileId) {
   return Buffer.from(await response.arrayBuffer());
 }
 function handleTelegramMessage(message) {
-  if (!message || !message.from || !message.chat || message.chat.type !== 'private') return;
+  if (!message || !message.from || !message.chat) return;
+  const isGroup = message.chat.type === 'group' || message.chat.type === 'supergroup';
+  if (message.chat.type !== 'private' && !isGroup) return;
+  if (isGroup) {
+    const raw = typeof message.text === 'string' ? message.text.trim() : '';
+    const botUser = telegramBotUser.toLowerCase();
+    // /id en un grupo muestra también el ID del grupo, para poder autorizarlo.
+    if (/^\/id(?:@\w+)?(?:\s|$)/i.test(raw)) {
+      const target = (raw.match(/^\/id@(\w+)/i) || [])[1];
+      if (target && botUser && target.toLowerCase() !== botUser) return;
+      return telegramSend(message.chat.id, `Tu ID de Telegram es: ${message.from.id}\nEl ID de este grupo es: ${message.chat.id}\nAgregá el ID del grupo en Portainer (TELEGRAM_ALLOWED_GROUPS o TELEGRAM_ALLOWED_USERS) y redeplegá el Stack.`);
+    }
+    if (!telegramAllowedGroups.has(String(message.chat.id))) return;
+    if (!telegramAllowedUsers.has(String(message.from.id))) return;
+    if (typeof message.text === 'string') {
+      // En el grupo responde a comandos, menciones (@bot), respuestas a sus mensajes o a una operación pendiente.
+      const key = `telegram:${message.chat.id}:${message.from.id}`;
+      const mention = botUser && raw.toLowerCase().includes('@' + botUser);
+      const cmd = raw.match(/^\/\w+(?:@(\w+))?/);
+      if (cmd && cmd[1] && botUser && cmd[1].toLowerCase() !== botUser) return; // comando para otro bot
+      const replyToBot = message.reply_to_message && message.reply_to_message.from && botUser && String(message.reply_to_message.from.username || '').toLowerCase() === botUser;
+      const waiting = (telegramPending.get(key)?.expires > Date.now()) || (telegramChoices.get(key)?.expires > Date.now());
+      if (!cmd && !mention && !replyToBot && !waiting) return;
+      if (botUser) message = { ...message, text: raw.replace(new RegExp('(^|\\s)@' + telegramBotUser + '\\b', 'ig'), ' ').replace(/\s+/g, ' ').trim() };
+    } else if (!message.document) {
+      const replyToBot = message.reply_to_message && message.reply_to_message.from && botUser && String(message.reply_to_message.from.username || '').toLowerCase() === botUser;
+      if (!replyToBot) return; // audios del grupo: solo si responden a un mensaje del bot
+    }
+  }
   const ctx = {
     platform: 'telegram', userId: String(message.from.id), chatId: message.chat.id,
     send: (t) => telegramSend(message.chat.id, t),
@@ -825,6 +857,8 @@ async function startTelegramBot() {
   if (!telegramAllowedUsers.size) console.warn('Telegram está configurado, pero falta TELEGRAM_ALLOWED_USERS; las consultas quedan bloqueadas.');
   let offset = 0;
   try {
+    const me = await telegramCall('getMe');
+    telegramBotUser = String(me.username || '');
     const webhook = await telegramCall('getWebhookInfo');
     if (webhook.url) { console.error('Telegram: hay un webhook configurado. Se conserva; quitá el webhook o usá un bot dedicado para activar polling.'); return; }
   } catch (error) {
@@ -832,6 +866,7 @@ async function startTelegramBot() {
     return;
   }
   console.log('Bot de Telegram iniciado con consultas privadas y acceso restringido.');
+  if (telegramAllowedGroups.size) console.log(`Telegram: también responde en ${telegramAllowedGroups.size} grupo(s) autorizado(s).`);
   while (true) {
     try {
       const updates = await telegramCall('getUpdates', { offset, timeout: 25, allowed_updates: ['message'] });

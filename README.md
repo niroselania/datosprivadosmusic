@@ -131,8 +131,13 @@ No subas archivos `.env`, `stack.env` ni credenciales al repositorio. `.gitignor
 
 Respaldá el volumen `archivo_it_data` desde el host o con la solución de backup de Docker que uses. Probá la restauración y guardá el backup cifrado. No agregues el contenido del volumen al repositorio.
 
+## Bot de Telegram en grupos
 
+Por defecto el bot responde solo en chat privado. Para usarlo en un grupo:
 
+1. Agregá el bot al grupo y escribí `/id` en el grupo: te muestra el ID del grupo (número negativo).
+2. Ponelo en `TELEGRAM_ALLOWED_GROUPS` (o junto a tu ID en `TELEGRAM_ALLOWED_USERS`) y redeplegá el Stack.
+3. En el grupo responde solo a tus comandos (`/buscar dato`), a menciones (`@tubot dato`), a respuestas a sus mensajes y a los archivos que mandes. Solo atiende a los usuarios de `TELEGRAM_ALLOWED_USERS`.
+4. Para que lea menciones y respuestas sin comando, en @BotFather usá `/setprivacy` → Disable y volvé a agregar el bot al grupo.
 
-
-
+Ojo: todo lo que el bot conteste en el grupo lo ven todos los miembros.
