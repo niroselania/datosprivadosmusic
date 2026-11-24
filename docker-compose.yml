@@ -13,6 +13,7 @@ services:
       TRUST_PROXY: "1"
       COOKIE_SECURE: "${COOKIE_SECURE:-0}"
       MAX_UPLOAD_MB: "100"
+      RELEVAMIENTO_URL: "http://relevamiento:8080"
       TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"
       TELEGRAM_ALLOWED_USERS: "${TELEGRAM_ALLOWED_USERS:-}"
       DISCORD_BOT_TOKEN: "${DISCORD_BOT_TOKEN:-}"
@@ -29,6 +30,34 @@ services:
     tmpfs:
       - /tmp:size=64m,mode=1777
 
+  # Relevamiento de equipos (Liquid). Sin puertos publicados: se entra por /relevamiento/ con el mismo usuario y contraseña.
+  relevamiento:
+    build: ./relevamiento
+    image: archivo-relevamiento:latest
+    container_name: archivo-relevamiento
+    restart: unless-stopped
+    environment:
+      APP_PASSWORD: ""
+      DATA_DIR: /data
+    volumes:
+      - relevamiento_data:/data
+  relevamiento-bot:
+    build: ./relevamiento
+    image: archivo-relevamiento:latest
+    container_name: archivo-relevamiento-bot
+    command: ["python", "bot.py"]
+    restart: unless-stopped
+    depends_on:
+      - relevamiento
+    environment:
+      TELEGRAM_BOT_TOKEN: "${RELEVAMIENTO_TELEGRAM_BOT_TOKEN:-}"
+      ALLOWED_CHAT_IDS: "${RELEVAMIENTO_ALLOWED_CHAT_IDS:-}"
+      DATA_DIR: /data
+    volumes:
+      - relevamiento_data:/data
+
 volumes:
   archivo_it_data:
     name: archivo_it_data
+  relevamiento_data:
+    name: ${RELEVAMIENTO_VOLUME:-relevamiento_data}

@@ -26,6 +26,16 @@ Aplicación web privada de música dividida en dos secciones, **Xino** y **Niros
 5. El puerto se publica como `${APP_PORT:-9090}` para acceder desde otras PCs de la red local usando `http://IP-DEL-SERVIDOR:9090`. El valor predeterminado `COOKIE_SECURE=0` permite iniciar sesión por HTTP durante pruebas en una red confiable. Para usar un proxy inverso con HTTPS, configurá `COOKIE_SECURE=1` y reenviá al puerto del servidor. No expongas el puerto directamente a Internet; para acceso remoto usá HTTPS y VPN.
 6. En la web, iniciá sesión y cargá archivos o una carpeta completa. La biblioteca aparece primero y el índice de búsqueda se completa en segundo plano. Al subir una carpeta, la aplicación sugiere categorías usando nombres y subcarpetas; también podés elegir una categoría manualmente. Cada archivo puede pesar hasta 100 MB.
 
+## Relevamiento de equipos (Liquid)
+
+El sitio incluye el **Relevamiento de equipos** (versión Liquid Glass) en `http://IP-DEL-SERVIDOR:9090/relevamiento/`, protegido por **la misma pantalla de inicio de sesión** y el mismo usuario y contraseña (`APP_USER` / `APP_PASSWORD`). Desde la biblioteca de música se entra con el botón **🖥 Relevamiento** de la barra superior, y desde el relevamiento se vuelve con **♪ Música**. **Salir** cierra la sesión de los dos.
+
+- El código está en la carpeta `relevamiento/` y corre como un contenedor aparte (`archivo-relevamiento`) dentro del mismo Stack. No publica ningún puerto: solo se llega a él a través del sitio y con sesión iniciada.
+- Los datos se guardan en el volumen `relevamiento_data` (SQLite). La primera vez se cargan los datos iniciales de `seed.json`.
+- **Para conservar los datos de un despliegue anterior del relevamiento**, definí en el Stack `RELEVAMIENTO_VOLUME` con el nombre del volumen existente (en Portainer > Volumes, por ejemplo `relevamientos_relevamiento_data`). Detené antes el Stack viejo del relevamiento para que no usen la misma base al mismo tiempo. Otra opción: dejarlo vacío y usar **Importar Excel** con la planilla actualizada.
+- Bot de Telegram del relevamiento (opcional): cargá `RELEVAMIENTO_TELEGRAM_BOT_TOKEN` (un bot distinto del de la biblioteca) y `RELEVAMIENTO_ALLOWED_CHAT_IDS` con los IDs autorizados. Si no definís IDs, cualquiera que encuentre el bot puede consultarlo. Sin token, el contenedor `archivo-relevamiento-bot` queda en espera y no hace nada.
+- Después de subir estos cambios al repositorio, en Portainer usá **Update the stack** con **Re-pull image and redeploy** para que se construya la imagen nueva del relevamiento.
+
 ## Secciones de música: Xino y Niros
 
 La biblioteca se divide en dos secciones: **Xino** y **Niros**. Al tocar **＋ Agregar** hay que elegir una de las dos antes de subir (si ya estás dentro de una sección, queda elegida). Se aceptan TXT, MD, CSV, TSV, LOG, Word (DOC/DOCX), PDF y Excel (XLS/XLSX/XLSM).

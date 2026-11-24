@@ -6,6 +6,7 @@ const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const http = require('http');
 const mammoth = require('mammoth');
 const XLSX = require('xlsx');
 const { PDFParse } = require('pdf-parse');
@@ -66,8 +67,9 @@ class JsonSessionStore extends session.Store {
 
 app.disable('x-powered-by');
 if (process.env.TRUST_PROXY === '1') app.set('trust proxy', 1);
-app.use(express.urlencoded({ extended: false, limit: '20kb' }));
-app.use(express.json({ limit: '2mb' }));
+// Los cuerpos JSON se leen solo en /api; /relevamiento se reenvía sin tocar al servicio de relevamiento.
+app.use('/api', express.urlencoded({ extended: false, limit: '20kb' }));
+app.use('/api', express.json({ limit: '2mb' }));
 app.use(session({
   name: 'archivoit.sid', secret: SECRET, resave: false, saveUninitialized: false,
   store: new JsonSessionStore(),
@@ -85,6 +87,35 @@ app.post('/api/login', authLimiter, (req, res) => {
   } else res.status(401).json({ error: 'Usuario o contraseña incorrectos.' });
 });
 app.post('/api/logout', loggedIn, (req, res) => req.session.destroy(() => res.json({ ok: true })));
+// ---- Relevamiento de equipos (Liquid) detrás del mismo inicio de sesión ----
+// El servicio Python no publica puertos: solo se llega a él a través de este sitio y con sesión iniciada.
+const RELEVAMIENTO = new URL(process.env.RELEVAMIENTO_URL || 'http://relevamiento:8080');
+const HOP_HEADERS = new Set(['connection','keep-alive','proxy-authenticate','proxy-authorization','te','trailer','transfer-encoding','upgrade','host','cookie','authorization']);
+app.use('/relevamiento', (req, res) => {
+  const pathOnly = req.originalUrl.split('?')[0];
+  if (pathOnly === '/relevamiento') return res.redirect(302, '/relevamiento/' + (req.originalUrl.includes('?') ? req.originalUrl.slice(req.originalUrl.indexOf('?')) : ''));
+  if (!req.session.authenticated) {
+    if (req.method === 'GET' && !req.path.startsWith('/api/')) return res.sendFile(path.join(__dirname, 'public', 'login.html'));
+    return res.status(401).json({ error: 'Iniciá sesión para continuar.' });
+  }
+  if (req.path === '/health') return res.sendStatus(404);
+  const headers = {};
+  for (const [name, value] of Object.entries(req.headers)) if (!HOP_HEADERS.has(name)) headers[name] = value;
+  headers.host = RELEVAMIENTO.host;
+  const upstream = http.request({ protocol: RELEVAMIENTO.protocol, hostname: RELEVAMIENTO.hostname, port: RELEVAMIENTO.port || 80, method: req.method, path: req.url, headers, timeout: 120000 }, response => {
+    res.status(response.statusCode || 502);
+    for (const [name, value] of Object.entries(response.headers)) if (!HOP_HEADERS.has(name) && name !== 'set-cookie' && name !== 'www-authenticate') res.setHeader(name, value);
+    response.pipe(res);
+  });
+  upstream.on('timeout', () => upstream.destroy(new Error('timeout')));
+  upstream.on('error', () => {
+    if (res.headersSent) return res.destroy();
+    const wantsJson = req.path.startsWith('/api/');
+    if (wantsJson) return res.status(502).json({ error: 'El servicio de relevamiento no responde. Revisá que su contenedor esté activo.' });
+    res.status(502).type('html').send('<!doctype html><meta charset="utf-8"><title>Relevamiento</title><body style="font:15px system-ui;padding:40px"><h2>El relevamiento no está disponible</h2><p>El servicio de relevamiento no responde. Revisá en Portainer que el contenedor <b>archivo-relevamiento</b> esté activo.</p><p><a href="/">Volver a la biblioteca de música</a></p>');
+  });
+  req.pipe(upstream);
+});
 app.get('/api/me', (req, res) => res.json({ authenticated: Boolean(req.session.authenticated) }));
 
 const storage = multer.diskStorage({
