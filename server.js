@@ -134,6 +134,28 @@ const storage = multer.diskStorage({
     cb(null, `${stem}__${stamp}_${crypto.randomBytes(3).toString('hex')}${ext}`);
   }
 });
+// Guarda un archivo recibido por el bot con el mismo formato de nombre que la subida web.
+const BOT_MAX_BYTES = Math.min(MAX_MB, 20) * 1024 * 1024; // Telegram solo permite descargar archivos de hasta 20 MB.
+function safeUploadName(name) { return path.basename(String(name || '')).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').trim().slice(0, 160) || 'archivo'; }
+async function saveBotUpload(category, originalName, buffer) {
+  if (!CATEGORIES.includes(category)) throw new Error('Sección inválida');
+  const original = safeUploadName(originalName);
+  const ext = path.extname(original); const stem = path.basename(original, ext);
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const target = path.join(DATA, category, `${stem}__${stamp}_${crypto.randomBytes(3).toString('hex')}${ext}`);
+  if (!target.startsWith(path.join(DATA, category) + path.sep)) throw new Error('Ruta inválida');
+  const temp = path.join(DATA, category, `.${crypto.randomBytes(6).toString('hex')}.tmp`);
+  try { await fs.promises.writeFile(temp, buffer); await fs.promises.rename(temp, target); }
+  catch (error) { await fs.promises.rm(temp, { force: true }).catch(() => {}); throw error; }
+  cacheAt = 0;
+  return original;
+}
+function sectionFromText(text) {
+  const t = String(text || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9 ]/g, ' ').trim();
+  if (/^1$/.test(t)) return CATEGORIES[0];
+  if (/^2$/.test(t)) return CATEGORIES[1];
+  return CATEGORIES.find(c => new RegExp(`(^|\\s)${c.toLowerCase()}(\\s|$)`).test(t)) || null;
+}
 const upload = multer({ storage, limits: { fileSize: MAX_MB * 1024 * 1024, files: 100 }, fileFilter: (req, file, cb) => {
   const ext = path.extname(file.originalname).slice(1).toLowerCase();
   const accepted = !ext || ALLOWED.has(ext);
@@ -592,13 +614,20 @@ async function handleBotMessage(ctx) {
   if (!allowed.has(userId)) return; // No revelar si el bot contiene datos.
   const key = `${platform}:${chatId}:${userId}`;
   if (/^\/(start|help)(?:@\w+)?(?:\s|$)/i.test(text)) {
-    return send('Archivo IT está listo. Escribí una palabra o usá §buscar backup para consultar archivos. Para agregar texto, usá §agregar backup (o “agregame info backup”), elegí un número, escribí el texto y confirmalo. §cancelar descarta la operación.');
+    return send('Archivo IT está listo. Escribí una palabra o usá §buscar backup para consultar archivos. Para agregar texto, usá §agregar backup (o “agregame info backup”), elegí un número, escribí el texto y confirmalo. Para subir un archivo, mandámelo como documento (📎 › Archivo) y elegí la sección: Xino o Niros (o escribí la sección en el comentario del archivo). §cancelar descarta la operación.');
   }
   if (/^\/cancelar(?:@\w+)?(?:\s|$)/i.test(text)) {
+    clearTimeout(telegramPending.get(key)?.askTimer);
     telegramChoices.delete(key); telegramPending.delete(key);
-    return send('Listo, cancelé la operación y descarté el texto pendiente.');
+    return send('Listo, cancelé la operación y descarté lo pendiente.');
   }
   const pending = telegramPending.get(key);
+  if (pending && pending.expires > Date.now() && pending.state === 'await_section') {
+    const section = sectionFromText(text);
+    if (!section) return send(`¿En qué sección guardo ${pending.files.length === 1 ? `“${pending.files[0].name}”` : `los ${pending.files.length} archivos`}?\n\n1. ${CATEGORIES[0]}\n2. ${CATEGORIES[1]}\n\nRespondé con el número o el nombre, o usá §cancelar.`);
+    clearTimeout(pending.askTimer); telegramPending.delete(key);
+    return saveBotFiles(ctx, pending.files, section);
+  }
   if (pending && pending.expires > Date.now() && pending.state === 'await_text') {
     if (!text) return send('Mandame el texto que querés agregar o escribí §cancelar.');
     if (text.length > 20000) return send('El texto supera el máximo de 20.000 caracteres. Mandá una versión más corta o escribí §cancelar.');
@@ -688,8 +717,57 @@ function handleTelegramMessage(message) {
     allowed: telegramAllowedUsers, allowEnv: 'TELEGRAM_ALLOWED_USERS'
   };
   if (typeof message.text === 'string') return handleBotMessage({ ...ctx, text: message.text.trim() });
+  if (message.document) return handleBotDocument(ctx, { name: message.document.file_name, size: message.document.file_size || 0, caption: message.caption || '', download: () => telegramDownload(message.document.file_id) });
   const audio = message.voice || message.audio;
   if (audio) return handleVoiceMessage(ctx, () => telegramDownload(audio.file_id), { duration: audio.duration, size: audio.file_size });
+}
+// ---- Subida de archivos desde el bot ----
+// El archivo se valida (usuario autorizado, formato y tamaño), se pide la sección y recién ahí se descarga y guarda.
+async function handleBotDocument(ctx, file) {
+  if (!ctx.allowed.has(ctx.userId)) return; // sin respuesta a usuarios no autorizados
+  const send = wrapSend(ctx);
+  const name = safeUploadName(file.name);
+  const ext = path.extname(name).slice(1).toLowerCase();
+  if (!ext || !ALLOWED.has(ext)) return send(`“${name}” no se puede subir. Formatos admitidos: ${[...ALLOWED].join(', ')}.`);
+  if (file.size > BOT_MAX_BYTES) return send(`“${name}” pesa ${(file.size / 1048576).toFixed(1)} MB. Desde el bot se pueden subir archivos de hasta ${BOT_MAX_BYTES / 1048576} MB; para archivos más grandes usá la web.`);
+  const key = `${ctx.platform}:${ctx.chatId}:${ctx.userId}`;
+  const entry = { name, size: file.size, download: file.download };
+  const section = sectionFromText(file.caption);
+  if (section) return saveBotFiles(ctx, [entry], section);
+  const pending = telegramPending.get(key);
+  // Si manda varios archivos seguidos, se juntan y se guardan todos en la misma sección.
+  if (pending && pending.expires > Date.now() && pending.state === 'await_section') {
+    if (pending.files.length >= 20) return send('Ya hay 20 archivos esperando sección. Elegí la sección primero.');
+    pending.files.push(entry); pending.expires = Date.now() + 10 * 60 * 1000;
+    clearTimeout(pending.askTimer);
+    pending.askTimer = setTimeout(() => send(`Recibí ${pending.files.length} archivos. ¿En qué sección los guardo?\n\n1. ${CATEGORIES[0]}\n2. ${CATEGORIES[1]}\n\nRespondé con el número o el nombre, o usá §cancelar.`).catch(() => {}), 1500);
+    return;
+  }
+  telegramChoices.delete(key);
+  const fresh = { state: 'await_section', files: [entry], expires: Date.now() + 10 * 60 * 1000 };
+  telegramPending.set(key, fresh);
+  fresh.askTimer = setTimeout(() => {
+    const many = fresh.files.length > 1;
+    send(`${many ? `Recibí ${fresh.files.length} archivos` : `Recibí “${name}”`}. ¿En qué sección ${many ? 'los' : 'lo'} guardo?\n\n1. ${CATEGORIES[0]}\n2. ${CATEGORIES[1]}\n\nRespondé con el número o el nombre, o usá §cancelar.`).catch(() => {});
+  }, 1500);
+}
+async function saveBotFiles(ctx, files, section) {
+  const send = wrapSend(ctx);
+  const saved = [], failed = [];
+  for (const file of files) {
+    try {
+      const buffer = await file.download();
+      if (buffer.length > BOT_MAX_BYTES) throw new Error('demasiado grande');
+      saved.push(await saveBotUpload(section, file.name, buffer));
+    } catch (error) {
+      console.error(`El bot no pudo guardar un archivo (${ctx.platform}).`);
+      failed.push(file.name);
+    }
+  }
+  const lines = [];
+  if (saved.length) lines.push(`✅ Guardé en ${section}:\n${saved.map(n => `• ${n}`).join('\n')}\n\nYa aparece en la web; el contenido se puede buscar en unos segundos.`);
+  if (failed.length) lines.push(`⚠️ No pude guardar:\n${failed.map(n => `• ${n}`).join('\n')}\nProbá de nuevo o subilo desde la web.`);
+  return send(lines.join('\n\n'));
 }
 // Bot de Discord opcional (solo mensajes directos). Token y lista permitida se configuran en Portainer.
 const discordToken = String(process.env.DISCORD_BOT_TOKEN || '').trim();
@@ -708,6 +786,13 @@ function handleDiscordMessage(message) {
     send: (t) => discordSend(message, t), allowed: discordAllowedUsers, allowEnv: 'DISCORD_ALLOWED_USERS'
   };
   const content = typeof message.content === 'string' ? message.content.trim() : '';
+  // Archivos adjuntos (no audio): se suben a la biblioteca. El texto del mensaje puede indicar la sección.
+  const docs = message.attachments ? [...message.attachments.values()].filter(a => !String(a.contentType || '').startsWith('audio/')) : [];
+  if (docs.length) return (async () => { for (const a of docs) await handleBotDocument(ctx, { name: a.name, size: a.size || 0, caption: content, download: async () => {
+    const response = await fetch(a.url, { signal: AbortSignal.timeout(60000) });
+    if (!response.ok) throw new Error('descarga fallida');
+    return Buffer.from(await response.arrayBuffer());
+  } }); })();
   if (content) return handleBotMessage({ ...ctx, text: content.replace(/^!/, '/') }); // los comandos usan ! en Discord
   const audio = message.attachments && [...message.attachments.values()].find(a => String(a.contentType || '').startsWith('audio/'));
   if (audio) return handleVoiceMessage(ctx, async () => {
