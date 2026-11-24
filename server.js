@@ -87,6 +87,8 @@ app.post('/api/login', authLimiter, (req, res) => {
   } else res.status(401).json({ error: 'Usuario o contraseña incorrectos.' });
 });
 app.post('/api/logout', loggedIn, (req, res) => req.session.destroy(() => res.json({ ok: true })));
+// Las páginas HTML nunca se guardan en caché: así siempre se ve la pantalla de inicio actual.
+const noStore = res => res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
 // ---- Relevamiento de equipos (Liquid) detrás del mismo inicio de sesión ----
 // El servicio Python no publica puertos: solo se llega a él a través de este sitio y con sesión iniciada.
 const RELEVAMIENTO = new URL(process.env.RELEVAMIENTO_URL || 'http://relevamiento:8080');
@@ -95,7 +97,7 @@ app.use('/relevamiento', (req, res) => {
   const pathOnly = req.originalUrl.split('?')[0];
   if (pathOnly === '/relevamiento') return res.redirect(302, '/relevamiento/' + (req.originalUrl.includes('?') ? req.originalUrl.slice(req.originalUrl.indexOf('?')) : ''));
   if (!req.session.authenticated) {
-    if (req.method === 'GET' && !req.path.startsWith('/api/')) return res.sendFile(path.join(__dirname, 'public', 'login.html'));
+    if (req.method === 'GET' && !req.path.startsWith('/api/')) { noStore(res); return res.sendFile(path.join(__dirname, 'public', 'login.html')); }
     return res.status(401).json({ error: 'Iniciá sesión para continuar.' });
   }
   if (req.path === '/health') return res.sendStatus(404);
@@ -491,8 +493,8 @@ app.post('/api/edit/:id', loggedIn, async (req,res) => {
   res.download(item.abs, item.name);
 });
 app.use('/api', (req,res) => res.status(404).json({ error:'Ruta inexistente.' }));
-app.use(express.static(path.join(__dirname, 'public'), { index: false, etag: true, maxAge: '1h' }));
-app.get('/{*splat}', (req,res) => req.session.authenticated ? res.sendFile(path.join(__dirname,'public','index.html')) : res.sendFile(path.join(__dirname,'public','login.html')));
+app.use(express.static(path.join(__dirname, 'public'), { index: false, etag: true, maxAge: '1h', setHeaders: (res, file) => { if (file.endsWith('.html')) noStore(res); } }));
+app.get('/{*splat}', (req,res) => { noStore(res); res.sendFile(path.join(__dirname,'public', req.session.authenticated ? 'index.html' : 'login.html')); });
 // Bot de Telegram opcional. El token y la lista permitida se configuran en Portainer.
 const telegramToken = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const telegramAllowedUsers = new Set(String(process.env.TELEGRAM_ALLOWED_USERS || '').split(/[\s,;]+/).filter(x => /^\d+$/.test(x)));
