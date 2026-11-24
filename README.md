@@ -137,7 +137,7 @@ Por defecto el bot responde solo en chat privado. Para usarlo en un grupo:
 
 1. Agregá el bot al grupo y escribí `/id` en el grupo: te muestra el ID del grupo (número negativo).
 2. Ponelo en `TELEGRAM_ALLOWED_GROUPS` (o junto a tu ID en `TELEGRAM_ALLOWED_USERS`) y redeplegá el Stack.
-3. En el grupo responde solo a tus comandos (`/buscar dato`), a menciones (`@tubot dato`), a respuestas a sus mensajes y a los archivos que mandes. Solo atiende a los usuarios de `TELEGRAM_ALLOWED_USERS`.
-4. Para que lea menciones y respuestas sin comando, en @BotFather usá `/setprivacy` → Disable y volvé a agregar el bot al grupo.
+3. En el grupo funciona igual que en privado: escribís una palabra y busca, sin `/buscar`. Solo atiende a los usuarios de `TELEGRAM_ALLOWED_USERS`; los mensajes de los demás los ignora.
+4. Obligatorio: en @BotFather usá `/setprivacy` → Disable y volvé a agregar el bot al grupo. Si no, Telegram solo le pasa los mensajes que empiezan con `/`.
 
 Ojo: todo lo que el bot conteste en el grupo lo ven todos los miembros.

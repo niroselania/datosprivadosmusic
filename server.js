@@ -728,18 +728,10 @@ function handleTelegramMessage(message) {
     if (!telegramAllowedGroups.has(String(message.chat.id))) return;
     if (!telegramAllowedUsers.has(String(message.from.id))) return;
     if (typeof message.text === 'string') {
-      // En el grupo responde a comandos, menciones (@bot), respuestas a sus mensajes o a una operación pendiente.
-      const key = `telegram:${message.chat.id}:${message.from.id}`;
-      const mention = botUser && raw.toLowerCase().includes('@' + botUser);
+      // En el grupo funciona igual que en privado: cualquier texto de un usuario autorizado es una búsqueda.
       const cmd = raw.match(/^\/\w+(?:@(\w+))?/);
       if (cmd && cmd[1] && botUser && cmd[1].toLowerCase() !== botUser) return; // comando para otro bot
-      const replyToBot = message.reply_to_message && message.reply_to_message.from && botUser && String(message.reply_to_message.from.username || '').toLowerCase() === botUser;
-      const waiting = (telegramPending.get(key)?.expires > Date.now()) || (telegramChoices.get(key)?.expires > Date.now());
-      if (!cmd && !mention && !replyToBot && !waiting) return;
       if (botUser) message = { ...message, text: raw.replace(new RegExp('(^|\\s)@' + telegramBotUser + '\\b', 'ig'), ' ').replace(/\s+/g, ' ').trim() };
-    } else if (!message.document) {
-      const replyToBot = message.reply_to_message && message.reply_to_message.from && botUser && String(message.reply_to_message.from.username || '').toLowerCase() === botUser;
-      if (!replyToBot) return; // audios del grupo: solo si responden a un mensaje del bot
     }
   }
   const ctx = {
